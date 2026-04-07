@@ -1,0 +1,19 @@
+[project]
+name = "scripts-venv"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "attrs>=26.1.0",
+    "beautifulsoup4>=4.14.3",
+    "fire>=0.7.1",
+    "html2text>=2025.4.15",
+    "portalocker>=3.2.0",
+    "python-dateutil>=2.9.0.post0",
+    "pyttsx3>=2.99",
+    "pyyaml>=6.0.3",
+    "requests>=2.33.1",
+    "ruamel-yaml>=0.19.1",
+    "typer>=0.24.1",
+]
