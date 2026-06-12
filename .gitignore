@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+client_secrets.json
 
 # Virtual environments
 .venv
