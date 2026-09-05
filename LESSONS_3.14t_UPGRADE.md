@@ -1,8 +1,9 @@
 # Lessons: attempted upgrade to free-threaded Python 3.14 (3.14t)
 
 **Date:** 2026-09-05
-**Outcome:** Attempted, then **fully reverted to 3.13**. Free-threading is blocked by two
-upstream packages. Plain (GIL-enabled) 3.14 would have worked.
+**Outcome:** Free-threading attempted, then **reverted** — it is blocked by two upstream
+packages. The environment was subsequently upgraded to **plain (GIL-enabled) 3.14.6**,
+which works fine; see "Follow-up" at the end.
 
 ---
 
@@ -150,9 +151,8 @@ and the full suite green — **462 passed**.
 
 1. **Track `dspy`.** Run `uv add dspy` on `main`. Until then this failure recurs on every
    environment rebuild, disguised as an `AttributeError`.
-2. **Plain 3.14 is available whenever wanted** and is a clean upgrade — orjson, numpy,
-   pillow and opencv all ship working 3.14 wheels. Steps: `uv python pin 3.14`, bump
-   `requires-python` to `>=3.14`, `rm -rf .venv && uv sync`.
+2. **Plain 3.14 — done.** Completed on branch `3.14`; orjson, numpy, pillow and opencv all
+   ship working 3.14 wheels. See "Follow-up" below for the steps and one gotcha.
 3. **Retry free-threading when both gaps close.** Nothing in this codebase needs to change;
    these are purely upstream wheel-availability gaps. Check with:
 
@@ -164,3 +164,67 @@ and the full suite green — **462 passed**.
 4. **Free-threading may not be worth much here anyway.** It pays off only for CPU-bound work
    spread across threads; nothing in these scripts is threaded. Single-threaded code is
    typically somewhat *slower* on the free-threaded build.
+
+---
+
+## Follow-up: the plain 3.14 upgrade (completed)
+
+Done on branch `3.14`. All 462 tests pass on CPython 3.14.6 with the GIL enabled.
+`cv2` 4.13.0, `dspy` 3.3.1 and `orjson` 3.12.0 — the three packages that blocked
+free-threading — all work here without incident.
+
+```bash
+cd /Users/kosiew/GitHub/scripts_venv
+uv python install 3.14               # <- do not skip; see the gotcha below
+uv python pin 3.14
+# edit pyproject.toml: requires-python = ">=3.14"
+rm -rf .venv
+uv sync
+```
+
+### Gotcha: `uv python pin 3.14` can still select the free-threaded build
+
+The first attempt produced a **free-threaded** venv despite pinning plain `3.14`, and the
+sync then failed with:
+
+```
+error: Distribution `opencv-python==4.13.0.92` can't be installed because it doesn't have
+a source distribution or wheel for the current platform
+```
+
+Cause: uv prefers **managed** interpreters over system ones (Homebrew's `python3.14`), and
+at that moment the only *managed* 3.14 installed was `cpython-3.14.6+freethreaded`, left
+over from the free-threading attempt. A bare `3.14` request matched it.
+
+Fix: `uv python install 3.14` to fetch the plain managed build, then re-sync.
+
+**Always confirm the interpreter after pinning — do not trust the pin alone:**
+
+```bash
+.venv/bin/python -VV
+.venv/bin/python -c "import sys; print(sys._is_gil_enabled())"   # True on plain 3.14
+```
+
+A plain build prints `Python 3.14.6 (main, ...)`; a free-threaded one prints
+`Python 3.14.6 free-threading build (main, ...)`.
+
+### Check for ad-hoc packages before destroying the venv
+
+The `dspy` incident above was caused by `rm -rf .venv` pruning an untracked package.
+Snapshot first, and diff afterwards, so nothing disappears silently:
+
+```bash
+uv pip freeze | sed 's/==.*//' | sort > /tmp/before.txt
+# ... rm -rf .venv && uv sync ...
+uv pip freeze | sed 's/==.*//' | sort > /tmp/after.txt
+comm -23 /tmp/before.txt /tmp/after.txt      # anything listed was lost
+```
+
+This was run for the 3.14 upgrade and came back empty.
+
+### The lockfile shrinks a lot — this is expected
+
+`uv.lock` lost ~520 lines on this upgrade. That is not packages disappearing: raising
+`requires-python` to `>=3.14` prunes resolution branches that existed only for older
+interpreters. The package count was unchanged at 251, and `dspy`, `opencv-python`,
+`orjson`, `numpy` and `pillow` were all still present.
