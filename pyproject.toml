@@ -12,6 +12,7 @@ dependencies = [
     "google-api-python-client>=2.200.0",
     "google-auth-oauthlib>=1.4.1",
     "html2text>=2025.4.15",
+    "markdown>=3.10.3",
     "matplotlib>=3.11.1",
     "numpy>=2.4.6",
     "opencv-python>=4.13.0.92",
