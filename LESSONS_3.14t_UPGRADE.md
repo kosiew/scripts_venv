@@ -228,3 +228,60 @@ This was run for the 3.14 upgrade and came back empty.
 `requires-python` to `>=3.14` prunes resolution branches that existed only for older
 interpreters. The package count was unchanged at 251, and `dspy`, `opencv-python`,
 `orjson`, `numpy` and `pillow` were all still present.
+
+---
+
+## Follow-up: free-threaded 3.14t migration (completed 2026-10-09)
+
+Both blockers were removed in this repo rather than waiting on upstream:
+
+- `opencv-python` — the Raycast pencilize script was ported to Pillow + numpy
+  (output matches OpenCV to within 0.02% of pixels), then the dependency was removed.
+  The Alfred copy still imports `cv2`, but its workflow calls `/usr/local/bin/python3`,
+  which no longer exists, so it was already dead.
+- `orjson` — gone with `dspy`, which was removed as a dependency. `orjson` 3.13.0 still has
+  no `cp314t` wheel.
+
+Steps: snapshot `uv pip freeze`, `uv add click`, `uv python pin 3.14t`, `rm -rf .venv`,
+`uv sync`. Result: `Python 3.14.6 free-threading build`, `sys._is_gil_enabled()` → `False`,
+package snapshot identical before/after, 689 tests pass.
+
+### Checking wheels before migrating
+
+`uv pip compile --python-version 3.14t` is rejected by uv 0.11.21 (it cannot parse the `t`).
+Point `--python` at a real free-threaded interpreter instead, and resolve from the lockfile
+so you test the versions you actually run:
+
+```bash
+uv venv -q -p 3.14t /tmp/ft
+uv export --frozen --all-groups --no-hashes --no-emit-project -o /tmp/locked.txt
+uv pip sync --python /tmp/ft/bin/python --only-binary :all: /tmp/locked.txt
+```
+
+Resolving `pyproject.toml` fresh instead picked newer versions, among them `typer` 0.27.3,
+which no longer depends on `click`. That exposed tests importing `click` without declaring
+it, so `click` is now a direct dependency.
+
+### Remaining caveat: `lxml` re-enables the GIL
+
+`lxml` 6.1.3 ships `cp314t` wheels but does not declare GIL-free safety, so importing it
+re-enables the GIL for the rest of the process (with a `RuntimeWarning`). It arrives via
+`yfinance`, and `bs4` uses it automatically when installed. Scripts that import `bs4` or
+`yfinance` therefore run with the GIL on. Everything else stays GIL-free.
+
+`PYTHON_GIL=0` forces it off but is inherited by subprocesses: GIL-enabled interpreters
+(e.g. the `llm` CLI on 3.13) abort with `Python runtime state: preinitialized`, which broke
+two tests. Do not set it globally.
+
+Check a module with:
+
+```bash
+.venv/bin/python -c "import sys, lxml.etree; print(sys._is_gil_enabled())"
+```
+
+### Reverting
+
+```bash
+uv python pin 3.14      # plain managed 3.14 is already installed
+rm -rf .venv && uv sync
+```
