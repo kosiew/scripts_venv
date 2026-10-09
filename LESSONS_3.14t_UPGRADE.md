@@ -285,3 +285,153 @@ Check a module with:
 uv python pin 3.14      # plain managed 3.14 is already installed
 rm -rf .venv && uv sync
 ```
+
+---
+
+## Follow-up: re-applying 3.14t via Homebrew (2026-10-09)
+
+The pins above said free-threaded, but the venv on disk did not match:
+
+```
+.python-version      3.14+freethreaded
+pyproject.toml       requires-python = ">=3.14"
+.venv/pyvenv.cfg     version_info = 3.13.7   <-- home = /opt/homebrew/opt/python@3.13/bin
+```
+
+The migration commit (`5dde040`) touched only `.python-version`, `pyproject.toml`,
+`uv.lock` and this file — `.venv/` itself was never rebuilt, so it stayed on 3.13.7.
+
+**Lesson: the pins are not the environment.** `.python-version` is a *request*; only
+`.venv/pyvenv.cfg` and `python -VV` tell you what is installed. Check the venv, not the pin
+— this is the same warning as the plain-3.14 gotcha above, in the opposite direction.
+
+### Blocker: the local `uv` is too old to fetch a stable 3.14t
+
+```bash
+uv --version        # uv 0.7.12 (b3d7f7977 2025-06-11)  -- at ~/.cargo/bin/uv
+uv self update      # error: uv was installed through an external package manager
+```
+
+`uv` here is a `cargo install` build from June 2025, so `self update` refuses and its
+bundled python-build-standalone manifest predates stable 3.14t. The only free-threaded
+build it offers is a beta:
+
+```
+cpython-3.14.0b2+freethreaded-macos-aarch64-none    <download available>
+```
+
+So `uv python install 3.14t` — the route used earlier in this document — is not available
+on this machine. It is also the only `uv` on the box (nothing in `/opt/homebrew/bin` or
+`~/.local/bin`); the `uv 0.11.21` referenced earlier is gone.
+
+### Route taken: Homebrew's `python-freethreading`
+
+Homebrew ships a stable free-threaded build as a separate formula, bottled:
+
+```bash
+brew info python-freethreading     # stable 3.14.8 (bottled)
+brew install python-freethreading  # installs as /opt/homebrew/bin/python3.14t
+```
+
+The old `uv` still *discovers* it even though it cannot download one itself, so the
+existing pin keeps working unchanged:
+
+```bash
+uv python find '3.14+freethreaded'
+# /opt/homebrew/opt/python-freethreading/bin/python3.14t
+
+uv sync --python '3.14+freethreaded'
+```
+
+Note the formula is `python-freethreading`, not `python@3.14t`, and it is independent of
+`python@3.14` — both can be installed side by side.
+
+### Result
+
+```
+Python 3.14.8 free-threading build (main, Sep 30 2026, 17:55:09)
+sysconfig Py_GIL_DISABLED = 1
+sys._is_gil_enabled()     = False
+.venv/pyvenv.cfg home     = /opt/homebrew/opt/python-freethreading/bin
+```
+
+225 packages, every one from a wheel — no source builds. The before/after `uv pip freeze`
+diff (the `comm -23` check above) came back empty: nothing lost. `pyproject.toml`,
+`uv.lock` and `.python-version` all already matched, so the tree stayed clean — this was
+purely a venv rebuild.
+
+Tests: **688 passed, 1 failed** in `~/GitHub/python-scripts`. The failure is unrelated to
+the interpreter; see below.
+
+The `lxml` caveat above was reconfirmed on 3.14.8 — `lxml` 6.1.3 still ships a real
+`cp314t` wheel without declaring GIL-free safety. Bisecting every declared dependency, the
+only two that re-enable the GIL are `bs4` and `yfinance`, both via `lxml.etree`.
+`PYTHON_GIL=0` was again left unset.
+
+### Stale path in this document
+
+The header above says `~/scripts_venv` is a symlink to `~/GitHub/scripts_venv`. That is no
+longer true: `~/GitHub/scripts_venv` does not exist, and `~/scripts_venv` is now the real
+git checkout of `git@github.com:kosiew/scripts_venv.git`. Shebangs pointing at
+`/Users/kosiew/scripts_venv/.venv/bin/python` are unaffected.
+
+### The one failing test: the `llm` CLI venv
+
+`tests/test_alias_llm.py::test_llm_fragments_loaders_real_cli` shells out to
+`/Users/kosiew/GitHub/llm/.venv/bin/llm`. Two separate problems, neither caused by 3.14t:
+
+**1. That venv's interpreter was a dangling symlink** (fixed). It was built on Python 3.10:
+
+```
+.venv/bin/python3.10 -> /usr/local/opt/python@3.10/bin/python3.10   # gone
+```
+
+Homebrew's `python@3.10` has since been removed, so exec'ing the `llm` script failed with
+`FileNotFoundError` on the *script* path — a misleading errno: the file existed, its
+interpreter did not. **A `FileNotFoundError` on a script that plainly exists means a broken
+shebang.** Rebuilt on 3.13:
+
+```bash
+cd ~/GitHub/llm
+rm -rf .venv && uv venv -p 3.13 .venv
+uv pip install --python .venv/bin/python -e .
+uv pip install --python .venv/bin/python 'openai>=1.55.3,<2'   # see below
+```
+
+`llm --version`, `models list`, `aliases list`, `keys list`, `templates list` and
+`logs list` all work again.
+
+**2. Unpinned `openai` drifted across a major version.** `setup.py` asks for
+`openai>=1.55.3`, which now resolves to **openai 3.26.1** — and openai 3.x swapped its
+`httpx` dependency for **`httpx2`**. `llm/models.py` does a plain `import httpx`, which was
+only ever satisfied transitively, so the fresh install broke immediately:
+
+```
+ModuleNotFoundError: No module named 'httpx'
+```
+
+Constraining to `openai<2` restores `httpx` 0.28.1 and matches the 1.97.0 the old venv had.
+**Lesson: a transitively-satisfied import is a latent break.** It survives only as long as
+some dependency keeps pulling the package in; `llm` should depend on `httpx` directly.
+
+**3. The test cannot pass against this checkout** (not fixed — needs a decision).
+`~/GitHub/llm` is pinned at an upstream commit from 2025-01-19, version **0.19.1**, which
+has no `fragments` command at all; `llm fragments loaders` is parsed as a prompt and exits
+2. The test asserts the three loaders (`github:`, `issue:`, `pr:`) printed by the
+**`llm-fragments-github`** plugin, and `llm fragments` itself only arrived in llm 0.24.
+
+The old venv cannot have passed this test either — its `llm.egg-link` pointed at this same
+0.19.1 checkout with no plugins installed — so the "689 passed" recorded earlier was from a
+machine or checkout that is no longer reproducible here.
+
+Making it pass requires updating the checkout and adding the plugin, e.g.:
+
+```bash
+cd ~/GitHub/llm
+git remote add upstream https://github.com/simonw/llm.git
+git fetch upstream && git merge upstream/main      # 0.19.1 -> 0.24+
+uv pip install --python .venv/bin/python -e . llm-fragments-github
+```
+
+`origin` is the fork `kosiew/llm` and is level with local `main`, so this is a real fork
+update, not a fast-forward of someone else's work. Left undone pending that call.
