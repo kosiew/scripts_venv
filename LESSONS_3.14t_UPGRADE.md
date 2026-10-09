@@ -398,8 +398,7 @@ uv pip install --python .venv/bin/python -e .
 uv pip install --python .venv/bin/python 'openai>=1.55.3,<2'   # see below
 ```
 
-`llm --version`, `models list`, `aliases list`, `keys list`, `templates list` and
-`logs list` all work again.
+(The `openai` constraint is revised below — on the `dev` branch it becomes `<3`.)
 
 **2. Unpinned `openai` drifted across a major version.** `setup.py` asks for
 `openai>=1.55.3`, which now resolves to **openai 3.26.1** — and openai 3.x swapped its
@@ -414,24 +413,108 @@ Constraining to `openai<2` restores `httpx` 0.28.1 and matches the 1.97.0 the ol
 **Lesson: a transitively-satisfied import is a latent break.** It survives only as long as
 some dependency keeps pulling the package in; `llm` should depend on `httpx` directly.
 
-**3. The test cannot pass against this checkout** (not fixed — needs a decision).
-`~/GitHub/llm` is pinned at an upstream commit from 2025-01-19, version **0.19.1**, which
-has no `fragments` command at all; `llm fragments loaders` is parsed as a prompt and exits
-2. The test asserts the three loaders (`github:`, `issue:`, `pr:`) printed by the
-**`llm-fragments-github`** plugin, and `llm fragments` itself only arrived in llm 0.24.
+**3. The checkout was too old for the test** (resolved on the `dev` branch).
+At the time of the rebuild, `~/GitHub/llm` sat on an upstream commit from 2025-01-19,
+version **0.19.1**, which has no `fragments` command at all; `llm fragments loaders` was
+parsed as a prompt and exited 2. The test asserts the three loaders (`github:`, `issue:`,
+`pr:`) printed by the **`llm-fragments-github`** plugin, and `llm fragments` only arrived
+in llm 0.24. The old venv cannot have passed the test either — its `llm.egg-link` pointed
+at that same 0.19.1 checkout with no plugins — so the "689 passed" recorded earlier came
+from a checkout that was no longer current.
 
-The old venv cannot have passed this test either — its `llm.egg-link` pointed at this same
-0.19.1 checkout with no plugins installed — so the "689 passed" recorded earlier was from a
-machine or checkout that is no longer reproducible here.
+See the next section for how this was closed out.
 
-Making it pass requires updating the checkout and adding the plugin, e.g.:
+---
+
+## Follow-up: the `llm` dev branch (2026-10-09)
+
+`~/GitHub/llm` was switched to branch **`dev`** (`541a4f8`, version **0.32rc2**), which has
+`fragments_loaders` in `llm/cli.py` and has moved from `setup.py` to `pyproject.toml`.
+Rebuilt clean, since the venv still held the 0.19.1 editable install and an `openai<2` pin
+that `dev` explicitly contradicts (`dev` asks for `openai>=2.32.0`):
 
 ```bash
 cd ~/GitHub/llm
-git remote add upstream https://github.com/simonw/llm.git
-git fetch upstream && git merge upstream/main      # 0.19.1 -> 0.24+
-uv pip install --python .venv/bin/python -e . llm-fragments-github
+rm -rf .venv && uv venv -p 3.13 .venv
+uv pip install --python .venv/bin/python -e .
+uv pip install --python .venv/bin/python 'openai>=2.32.0,<3'
+uv pip install --python .venv/bin/python llm-fragments-github
 ```
 
-`origin` is the fork `kosiew/llm` and is level with local `main`, so this is a real fork
-update, not a fast-forward of someone else's work. Left undone pending that call.
+Result: `llm, version 0.32rc2` on Python 3.13.7, `llm-fragments-github` 0.4, and
+`llm fragments loaders` printing exactly the `github:`/`issue:`/`pr:` block the test
+asserts. **`python-scripts`: 689 passed, 0 failed.**
+
+### The `httpx` break is not version-specific — and `openai<3` is mandatory
+
+The same `ModuleNotFoundError: No module named 'httpx'` reappeared on `dev`, from
+`llm/models.py:30`. `dev` asks for `openai>=2.32.0` with no upper bound, which resolves to
+**openai 3.26.1**, and openai 3.x requires `httpx2<3,>=2.12.0` instead of `httpx`. So
+`httpx` stops arriving transitively and `llm`'s own `import httpx` fails.
+
+Installing `httpx` alongside openai 3.x is **not** a valid fix here:
+
+```
+llm/utils.py:157        def logging_client() -> httpx.Client
+llm/default_plugins/openai_models.py:1201   kwargs["http_client"] = logging_client()
+llm/default_plugins/openai_models.py:1203   openai.AsyncOpenAI(**kwargs)
+```
+
+`llm` hands its own **`httpx.Client`** to the openai constructor. openai 3.x expects an
+`httpx2` client, so the two cannot be mixed — openai must stay on 2.x. `openai 2.54.0`
+pulls `httpx` 0.28.1 back in and everything is consistent.
+
+**Lesson, sharper than before: an unbounded major-version range on a dependency you also
+import from is two bugs, not one.** `llm` should declare `httpx` directly *and* cap
+`openai<3` until it migrates to `httpx2`.
+
+### Correction: an earlier smoke test in this document was meaningless
+
+The 0.19.1 rebuild above was reported as verified with a loop like:
+
+```bash
+for c in "models list" "keys list"; do
+    out=$(.venv/bin/llm $c 2>&1 | head -2)
+    if [ $? -eq 0 ]; then echo ok; else echo FAIL; fi
+done
+```
+
+Two independent faults, both of which force "ok":
+
+1. **`$?` after a pipeline is `head`'s status**, not `llm`'s — `head` always succeeds.
+2. **zsh does not word-split unquoted `$c`.** `.venv/bin/llm $c` passes `"models list"` as
+   a *single* argv entry, so `llm` sees one unknown command. The same loop later reported
+   `FAIL` for every subcommand on a venv that was in fact fine.
+
+Fault 2 is the zsh-specific trap: the identical loop behaves as intended under bash. Split
+explicitly, and test the exit status of the command itself:
+
+```bash
+while IFS= read -r c; do
+    if eval ".venv/bin/llm $c" >/dev/null 2>&1; then echo ok; else echo "FAIL (exit $?)"; fi
+done <<'CMDS'
+models list
+fragments loaders
+CMDS
+```
+
+Re-verified this way, all of `--version`, `models list`, `aliases list`, `keys list`,
+`templates list`, `fragments list`, `fragments loaders` and `logs list -n 1` genuinely
+pass on 0.32rc2.
+
+### One flaky test, unrelated to any of this
+
+`tests/test_alias_fm.py::test_respond_capped_keeps_partial_output_on_timeout` failed once
+in four full randomized runs, then passed 3/3 in isolation and in three further full runs
+(689 passed each). It races a 0.5 s timeout against a subprocess that must emit `partial`
+before being killed:
+
+```python
+monkeypatch.setattr(_fm, "FM_BIN", _fake_fm_script(tmp_path, "echo partial; exec sleep 30"))
+assert _fm.respond_capped("Summarize", "input", max_chars=100, timeout=0.5) == "partial\n"
+```
+
+Wall-clock flakiness under load, not order dependence — `-p no:randomly` makes no
+difference. Worth noting that free-threaded builds are somewhat *slower* single-threaded
+(see Recommendations above), which can only tighten a 0.5 s budget; raising the timeout or
+synchronising on the first byte would make it deterministic.
