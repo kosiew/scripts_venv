@@ -27,3 +27,9 @@ dependencies = [
     "typer>=0.24.1",
     "yfinance>=1.7.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest-randomly>=5.0.0",
+    "pytest-xdist>=3.8.0",
+]
